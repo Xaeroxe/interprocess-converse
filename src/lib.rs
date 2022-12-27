@@ -347,7 +347,7 @@ impl<T: Serialize + Unpin> OwnedWriteHalf<T> {
             },
         )
         .await?;
-        self.next_id += 1;
+        self.next_id = self.next_id.wrapping_add(1);
         Ok(async move {
             if read_half_dropped {
                 return Err(Error::ReadHalfDropped);
