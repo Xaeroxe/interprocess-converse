@@ -1,5 +1,6 @@
+#![doc = include_str!("../README.md")]
+
 use futures_util::{SinkExt, Stream, StreamExt};
-use interprocess::local_socket::ToLocalSocketName;
 use interprocess_typed::{
     LocalSocketListenerTyped, LocalSocketStreamTyped, OwnedReadHalfTyped, OwnedWriteHalfTyped,
 };
@@ -24,6 +25,7 @@ struct InternalMessage<T> {
     is_reply: bool,
 }
 
+/// A message received from the connected peer, which you may choose to reply to.
 pub struct ReceivedMessage<T> {
     message: Option<T>,
     conversation_id: u64,
@@ -31,14 +33,20 @@ pub struct ReceivedMessage<T> {
 }
 
 impl<T: Serialize + Unpin> ReceivedMessage<T> {
+    /// Pulls the message from this, panicking if the message had already been taken prior.
     pub fn take_message(&mut self) -> T {
         self.message.take().expect("message already taken!")
     }
 
+    /// Pulls the message from this, returning `None` if the message had already been taken prior.
     pub fn take_message_opt(&mut self) -> Option<T> {
         self.message.take()
     }
 
+    /// Sends the given message as a reply to this one. There are two ways for the peer to receive this reply
+    ///
+    /// 1. `.await` both layers of [OwnedWriteHalf::send] or [OwnedWriteHalf::send_timeout]
+    /// 2. They'll receive it as the return value of [OwnedWriteHalf::ask] or [OwnedWriteHalf::ask_timeout].
     pub async fn reply(self, reply: T) -> Result<(), Error> {
         SinkExt::send(
             &mut *self.raw_write.lock().await,
@@ -58,15 +66,21 @@ struct ReplySender<T> {
     conversation_id: u64,
 }
 
+/// Errors which can occur on an `interprocess-converse` connection.
 #[derive(Debug)]
 pub enum Error {
+    /// Error from `std::io`
     Io(io::Error),
+    /// Error from the `bincode` crate
     Bincode(bincode::Error),
+    /// A message was received that exceeded the configured length limit
     ReceivedMessageTooLarge,
+    /// A message was sent that exceeded the configured length limit
     SentMessageTooLarge,
-    TimeOut,
+    /// A reply wasn't received within the timeout specified
+    Timeout,
+    /// The read half was dropped, crippling the ability to receive replies.
     ReadHalfDropped,
-    CannotReplyToReply,
 }
 
 impl From<interprocess_typed::Error> for Error {
@@ -82,17 +96,24 @@ impl From<interprocess_typed::Error> for Error {
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
+pub use interprocess_typed::{generate_socket_name, ToLocalSocketName};
+
+/// Listens for new connections on the bound socket name.
 pub struct LocalSocketListener<T> {
     raw: LocalSocketListenerTyped<InternalMessage<T>>,
 }
 
 impl<T> LocalSocketListener<T> {
+    /// Begins listening for connections to the given socket name. The socket does not need to exist prior to calling this function.
     pub fn bind<'a>(name: impl ToLocalSocketName<'a>) -> io::Result<Self> {
         Ok(Self {
             raw: LocalSocketListenerTyped::bind(name)?,
         })
     }
 
+    /// Accepts the connection, initializing it with the given size limit specified in bytes.
+    ///
+    /// Be careful, large limits might create a vulnerability to a Denial of Service attack.
     pub async fn accept_with_limit(&self, size_limit: u64) -> io::Result<LocalSocketStream<T>> {
         self.raw.accept_with_limit(size_limit).await.map(|raw| {
             let (read, write) = raw.into_split();
@@ -104,6 +125,7 @@ impl<T> LocalSocketListener<T> {
         })
     }
 
+    /// Accepts the connection, initializing it with a default size limit of 1 MB per message.
     pub async fn accept(&self) -> io::Result<LocalSocketStream<T>> {
         self.raw.accept().await.map(|raw| {
             let (read, write) = raw.into_split();
@@ -116,7 +138,7 @@ impl<T> LocalSocketListener<T> {
     }
 }
 
-/// TODO: Docs
+/// A duplex async connection for sending and receiving messages of a particular type, and optionally replying to those messages.
 ///
 /// You may have noticed that unlike `interprocess` and `interprocess-typed`, you cannot send or receive with this until you split it
 /// into its two halves. This is intentional, because due to the reply mechanism it would be too easy to accidentally dead lock your programs
@@ -128,6 +150,9 @@ pub struct LocalSocketStream<T> {
 }
 
 impl<T> LocalSocketStream<T> {
+    /// Creates a connection, initializing it with the given size limit specified in bytes.
+    ///
+    /// Be careful, large limits might create a vulnerability to a Denial of Service attack.
     pub async fn connect_with_limit<'a>(
         name: impl ToLocalSocketName<'a>,
         size_limit: u64,
@@ -142,6 +167,7 @@ impl<T> LocalSocketStream<T> {
         })
     }
 
+    /// Creates a connection, initializing it with a default size limit of 1 MB per message.
     pub async fn connect<'a>(name: impl ToLocalSocketName<'a>) -> io::Result<Self> {
         let (read, write) = LocalSocketStreamTyped::connect(name).await?.into_split();
         Ok(Self {
@@ -151,6 +177,7 @@ impl<T> LocalSocketStream<T> {
         })
     }
 
+    /// Splits this into two parts, the first can be used for reading from the socket, the second can be used for writing to the socket.
     pub fn into_split(self) -> (OwnedReadHalf<T>, OwnedWriteHalf<T>) {
         let (reply_data_sender, reply_data_receiver) = mpsc::unbounded_channel();
         let write = Arc::new(Mutex::new(self.write));
@@ -170,11 +197,13 @@ impl<T> LocalSocketStream<T> {
         )
     }
 
+    /// Returns the process id of the connected peer.
     pub fn peer_pid(&self) -> io::Result<u32> {
         self.read.peer_pid()
     }
 }
 
+/// Used to receive messages from the connected peer. ***You must drive this in order to receive replies on the [OwnedWriteHalf]***
 pub struct OwnedReadHalf<T> {
     raw: OwnedReadHalfTyped<InternalMessage<T>>,
     raw_write: Arc<Mutex<OwnedWriteHalfTyped<InternalMessage<T>>>>,
@@ -183,6 +212,7 @@ pub struct OwnedReadHalf<T> {
 }
 
 impl<T> OwnedReadHalf<T> {
+    /// Returns the process id of the connected peer.
     pub fn peer_pid(&self) -> io::Result<u32> {
         self.raw.peer_pid()
     }
@@ -252,6 +282,10 @@ impl<T: DeserializeOwned + Unpin> Stream for OwnedReadHalf<T> {
     }
 }
 
+/// Used to send messages to the connected peer. You may optionally receive replies to your messages as well.
+///
+/// ***You must drive the corresponding [OwnedReadHalf] in order to receive replies to your messages.***
+/// You can do this either by driving the `Stream` implementation, or calling [OwnedReadHalf::drive_forever].
 pub struct OwnedWriteHalf<T> {
     raw: Arc<Mutex<OwnedWriteHalfTyped<InternalMessage<T>>>>,
     reply_data_sender: mpsc::UnboundedSender<ReplySender<T>>,
@@ -259,12 +293,27 @@ pub struct OwnedWriteHalf<T> {
 }
 
 impl<T: Serialize + Unpin> OwnedWriteHalf<T> {
+    /// Returns the process id of the connected peer.
     pub async fn peer_pid(&self) -> io::Result<u32> {
         self.raw.lock().await.peer_pid()
     }
 
-    /// Returns a future wrapped in a future. You must `.await` the first layer to send the message, however `.await`ing the second layer
-    /// is optional. You only need to `.await` the second layer if you care about the reply to this message.
+    /// Send a message, and wait for a reply, with the default timeout. Shorthand for `.await`ing both layers of `.send(message)`.
+    pub async fn ask(&mut self, message: T) -> Result<T, Error> {
+        self.ask_timeout(DEFAULT_TIMEOUT, message).await
+    }
+
+    /// Send a message, and wait for a reply, up to timeout. Shorthand for `.await`ing both layers of `.send_timeout(message)`.
+    pub async fn ask_timeout(&mut self, timeout: Duration, message: T) -> Result<T, Error> {
+        match self.send_timeout(timeout, message).await {
+            Ok(fut) => fut.await,
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Sends a message to the peer on the other side of the connection. This returns a future wrapped in a future. You must
+    /// `.await` the first layer to send the message, however `.await`ing the second layer is optional. You only need to
+    /// `.await` the second layer if you care about the reply to your message. Waits up to the default timeout for a reply.
     pub async fn send(
         &mut self,
         message: T,
@@ -272,8 +321,10 @@ impl<T: Serialize + Unpin> OwnedWriteHalf<T> {
         self.send_timeout(DEFAULT_TIMEOUT, message).await
     }
 
-    /// Returns a future wrapped in a future. You must `.await` the first layer to send the message, however `.await`ing the second layer
-    /// is optional. You only need to `.await` the second layer if you care about the reply to this message.
+    /// Sends a message to the peer on the other side of the connection, waiting up to the specified timeout for a reply.
+    /// This returns a future wrapped in a future. You must  `.await` the first layer to send the message, however
+    /// `.await`ing the second layer is optional. You only need to  `.await` the second layer if you care about the
+    /// reply to your message.
     pub async fn send_timeout(
         &mut self,
         timeout: Duration,
@@ -306,7 +357,7 @@ impl<T: Serialize + Unpin> OwnedWriteHalf<T> {
                 Ok(Ok(Ok(value))) => Ok(value),
                 Ok(Ok(Err(e))) => Err(e),
                 Ok(Err(_)) => Err(Error::ReadHalfDropped),
-                Err(_) => Err(Error::TimeOut),
+                Err(_) => Err(Error::Timeout),
             }
         })
     }
