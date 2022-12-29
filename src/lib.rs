@@ -26,13 +26,13 @@ struct InternalMessage<T> {
 }
 
 /// A message received from the connected peer, which you may choose to reply to.
-pub struct ReceivedMessage<T> {
+pub struct ReceivedMessage<T: Serialize + DeserializeOwned + Unpin> {
     message: Option<T>,
     conversation_id: u64,
     raw_write: Arc<Mutex<OwnedWriteHalfTyped<InternalMessage<T>>>>,
 }
 
-impl<T: Serialize + Unpin> ReceivedMessage<T> {
+impl<T: Serialize + DeserializeOwned + Unpin> ReceivedMessage<T> {
     /// Peeks at the message, panicking if the message had already been taken prior.
     pub fn message(&self) -> &T {
         self.message_opt().expect("message already taken")
@@ -109,11 +109,11 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 pub use interprocess_typed::{generate_socket_name, ToLocalSocketName};
 
 /// Listens for new connections on the bound socket name.
-pub struct LocalSocketListener<T> {
+pub struct LocalSocketListener<T: Serialize + DeserializeOwned + Unpin> {
     raw: LocalSocketListenerTyped<InternalMessage<T>>,
 }
 
-impl<T> LocalSocketListener<T> {
+impl<T: Serialize + DeserializeOwned + Unpin> LocalSocketListener<T> {
     /// Begins listening for connections to the given socket name. The socket does not need to exist prior to calling this function.
     pub fn bind<'a>(name: impl ToLocalSocketName<'a>) -> io::Result<Self> {
         Ok(Self {
@@ -153,13 +153,13 @@ impl<T> LocalSocketListener<T> {
 /// You may have noticed that unlike `interprocess` and `interprocess-typed`, you cannot send or receive with this until you split it
 /// into its two halves. This is intentional, because due to the reply mechanism it would be too easy to accidentally dead lock your programs
 /// if you were using this without splitting it.
-pub struct LocalSocketStream<T> {
+pub struct LocalSocketStream<T: Serialize + DeserializeOwned + Unpin> {
     read: OwnedReadHalfTyped<InternalMessage<T>>,
     write: OwnedWriteHalfTyped<InternalMessage<T>>,
     next_id: u64,
 }
 
-impl<T> LocalSocketStream<T> {
+impl<T: Serialize + DeserializeOwned + Unpin> LocalSocketStream<T> {
     /// Creates a connection, initializing it with the given size limit specified in bytes.
     ///
     /// Be careful, large limits might create a vulnerability to a Denial of Service attack.
@@ -214,21 +214,21 @@ impl<T> LocalSocketStream<T> {
 }
 
 /// Used to receive messages from the connected peer. ***You must drive this in order to receive replies on the [OwnedWriteHalf]***
-pub struct OwnedReadHalf<T> {
+pub struct OwnedReadHalf<T: Serialize + DeserializeOwned + Unpin> {
     raw: OwnedReadHalfTyped<InternalMessage<T>>,
     raw_write: Arc<Mutex<OwnedWriteHalfTyped<InternalMessage<T>>>>,
     reply_data_receiver: mpsc::UnboundedReceiver<ReplySender<T>>,
     pending_reply: Vec<ReplySender<T>>,
 }
 
-impl<T> OwnedReadHalf<T> {
+impl<T: Serialize + DeserializeOwned + Unpin> OwnedReadHalf<T> {
     /// Returns the process id of the connected peer.
     pub fn peer_pid(&self) -> io::Result<u32> {
         self.raw.peer_pid()
     }
 }
 
-impl<T: DeserializeOwned + Unpin + Send + 'static> OwnedReadHalf<T> {
+impl<T: Serialize + DeserializeOwned + Unpin + Send + 'static> OwnedReadHalf<T> {
     /// Spawns a future onto the tokio runtime that will drive the receive mechanism.
     /// This allows you to receive replies to your messages, while completely ignoring any non-reply messages you get.
     ///
@@ -239,7 +239,7 @@ impl<T: DeserializeOwned + Unpin + Send + 'static> OwnedReadHalf<T> {
     }
 }
 
-impl<T: DeserializeOwned + Unpin> Stream for OwnedReadHalf<T> {
+impl<T: Serialize + DeserializeOwned + Unpin> Stream for OwnedReadHalf<T> {
     type Item = Result<ReceivedMessage<T>, Error>;
 
     fn poll_next(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -296,13 +296,13 @@ impl<T: DeserializeOwned + Unpin> Stream for OwnedReadHalf<T> {
 ///
 /// ***You must drive the corresponding [OwnedReadHalf] in order to receive replies to your messages.***
 /// You can do this either by driving the `Stream` implementation, or calling [OwnedReadHalf::drive_forever].
-pub struct OwnedWriteHalf<T> {
+pub struct OwnedWriteHalf<T: Serialize + DeserializeOwned + Unpin> {
     raw: Arc<Mutex<OwnedWriteHalfTyped<InternalMessage<T>>>>,
     reply_data_sender: mpsc::UnboundedSender<ReplySender<T>>,
     next_id: u64,
 }
 
-impl<T: Serialize + Unpin> OwnedWriteHalf<T> {
+impl<T: Serialize + DeserializeOwned + Unpin> OwnedWriteHalf<T> {
     /// Returns the process id of the connected peer.
     pub async fn peer_pid(&self) -> io::Result<u32> {
         self.raw.lock().await.peer_pid()
