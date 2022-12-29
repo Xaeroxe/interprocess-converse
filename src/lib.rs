@@ -33,9 +33,19 @@ pub struct ReceivedMessage<T> {
 }
 
 impl<T: Serialize + Unpin> ReceivedMessage<T> {
+    /// Peeks at the message, panicking if the message had already been taken prior.
+    pub fn message(&self) -> &T {
+        self.message_opt().expect("message already taken")
+    }
+
+    /// Peeks at the message, returning `None` if the message had already been taken prior.
+    pub fn message_opt(&self) -> Option<&T> {
+        self.message.as_ref()
+    }
+
     /// Pulls the message from this, panicking if the message had already been taken prior.
     pub fn take_message(&mut self) -> T {
-        self.message.take().expect("message already taken!")
+        self.take_message_opt().expect("message already taken")
     }
 
     /// Pulls the message from this, returning `None` if the message had already been taken prior.
