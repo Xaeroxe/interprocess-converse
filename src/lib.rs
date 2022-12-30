@@ -1,80 +1,21 @@
 #![doc = include_str!("../README.md")]
 
-use futures_util::{SinkExt, Stream, StreamExt};
-use interprocess_typed::{
-    LocalSocketListenerTyped, LocalSocketStreamTyped, OwnedReadHalfTyped, OwnedWriteHalfTyped,
-};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use async_io_converse::{AsyncReadConverse, AsyncWriteConverse, new_duplex_connection_with_limit, new_duplex_connection};
+use futures_util::{Stream, StreamExt};
+use serde::{de::DeserializeOwned, Serialize};
+use interprocess::local_socket::tokio::{OwnedWriteHalf as InterprocessOwnedWriteHalf, OwnedReadHalf as InterprocessOwnedReadHalf, LocalSocketListener as InterprocessLocalSocketListener, LocalSocketStream as InterprocessLocalSocketStream};
 use std::{
     future::Future,
     io,
     pin::Pin,
-    sync::Arc,
     task::{Context, Poll},
-    time::Duration,
+    time::Duration, marker::PhantomData, ffi::OsString,
 };
-use tokio::sync::{mpsc, oneshot, Mutex};
 
 #[cfg(test)]
 mod tests;
 
-#[derive(Deserialize, Serialize)]
-struct InternalMessage<T> {
-    user_message: T,
-    conversation_id: u64,
-    is_reply: bool,
-}
-
-/// A message received from the connected peer, which you may choose to reply to.
-pub struct ReceivedMessage<T: Serialize + DeserializeOwned + Unpin> {
-    message: Option<T>,
-    conversation_id: u64,
-    raw_write: Arc<Mutex<OwnedWriteHalfTyped<InternalMessage<T>>>>,
-}
-
-impl<T: Serialize + DeserializeOwned + Unpin> ReceivedMessage<T> {
-    /// Peeks at the message, panicking if the message had already been taken prior.
-    pub fn message(&self) -> &T {
-        self.message_opt().expect("message already taken")
-    }
-
-    /// Peeks at the message, returning `None` if the message had already been taken prior.
-    pub fn message_opt(&self) -> Option<&T> {
-        self.message.as_ref()
-    }
-
-    /// Pulls the message from this, panicking if the message had already been taken prior.
-    pub fn take_message(&mut self) -> T {
-        self.take_message_opt().expect("message already taken")
-    }
-
-    /// Pulls the message from this, returning `None` if the message had already been taken prior.
-    pub fn take_message_opt(&mut self) -> Option<T> {
-        self.message.take()
-    }
-
-    /// Sends the given message as a reply to this one. There are two ways for the peer to receive this reply
-    ///
-    /// 1. `.await` both layers of [OwnedWriteHalf::send] or [OwnedWriteHalf::send_timeout]
-    /// 2. They'll receive it as the return value of [OwnedWriteHalf::ask] or [OwnedWriteHalf::ask_timeout].
-    pub async fn reply(self, reply: T) -> Result<(), Error> {
-        SinkExt::send(
-            &mut *self.raw_write.lock().await,
-            InternalMessage {
-                user_message: reply,
-                is_reply: true,
-                conversation_id: self.conversation_id,
-            },
-        )
-        .await
-        .map_err(Into::into)
-    }
-}
-
-struct ReplySender<T> {
-    reply_sender: Option<oneshot::Sender<Result<T, Error>>>,
-    conversation_id: u64,
-}
+pub type ReceivedMessage<T> = async_io_converse::ReceivedMessage<InterprocessOwnedWriteHalf, T>;
 
 /// Errors which can occur on an `interprocess-converse` connection.
 #[derive(Debug)]
@@ -93,31 +34,33 @@ pub enum Error {
     ReadHalfDropped,
 }
 
-impl From<interprocess_typed::Error> for Error {
-    fn from(e: interprocess_typed::Error) -> Self {
+impl From<async_io_converse::Error> for Error {
+    fn from(e: async_io_converse::Error) -> Self {
         match e {
-            interprocess_typed::Error::Io(e) => Error::Io(e),
-            interprocess_typed::Error::Bincode(e) => Error::Bincode(e),
-            interprocess_typed::Error::ReceivedMessageTooLarge => Error::ReceivedMessageTooLarge,
-            interprocess_typed::Error::SentMessageTooLarge => Error::SentMessageTooLarge,
+            async_io_converse::Error::Io(e) => Error::Io(e),
+            async_io_converse::Error::Bincode(e) => Error::Bincode(e),
+            async_io_converse::Error::ReceivedMessageTooLarge => Error::ReceivedMessageTooLarge,
+            async_io_converse::Error::SentMessageTooLarge => Error::SentMessageTooLarge,
+            async_io_converse::Error::Timeout => Error::Timeout,
+            async_io_converse::Error::ReadHalfDropped => Error::ReadHalfDropped,
         }
     }
 }
 
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
-
-pub use interprocess_typed::{generate_socket_name, ToLocalSocketName};
+pub use interprocess::local_socket::ToLocalSocketName;
 
 /// Listens for new connections on the bound socket name.
 pub struct LocalSocketListener<T: Serialize + DeserializeOwned + Unpin> {
-    raw: LocalSocketListenerTyped<InternalMessage<T>>,
+    raw: InterprocessLocalSocketListener,
+    _phantom: PhantomData<T>,
 }
 
 impl<T: Serialize + DeserializeOwned + Unpin> LocalSocketListener<T> {
     /// Begins listening for connections to the given socket name. The socket does not need to exist prior to calling this function.
     pub fn bind<'a>(name: impl ToLocalSocketName<'a>) -> io::Result<Self> {
         Ok(Self {
-            raw: LocalSocketListenerTyped::bind(name)?,
+            raw: InterprocessLocalSocketListener::bind(name)?,
+            _phantom: PhantomData,
         })
     }
 
@@ -125,12 +68,12 @@ impl<T: Serialize + DeserializeOwned + Unpin> LocalSocketListener<T> {
     ///
     /// Be careful, large limits might create a vulnerability to a Denial of Service attack.
     pub async fn accept_with_limit(&self, size_limit: u64) -> io::Result<LocalSocketStream<T>> {
-        self.raw.accept_with_limit(size_limit).await.map(|raw| {
+        self.raw.accept().await.map(|raw| {
             let (read, write) = raw.into_split();
+            let (read, write) = new_duplex_connection_with_limit(size_limit, read, write);
             LocalSocketStream {
                 read,
                 write,
-                next_id: 0,
             }
         })
     }
@@ -139,10 +82,10 @@ impl<T: Serialize + DeserializeOwned + Unpin> LocalSocketListener<T> {
     pub async fn accept(&self) -> io::Result<LocalSocketStream<T>> {
         self.raw.accept().await.map(|raw| {
             let (read, write) = raw.into_split();
+            let (read, write) = new_duplex_connection(read, write);
             LocalSocketStream {
                 read,
                 write,
-                next_id: 0,
             }
         })
     }
@@ -154,9 +97,8 @@ impl<T: Serialize + DeserializeOwned + Unpin> LocalSocketListener<T> {
 /// into its two halves. This is intentional, because due to the reply mechanism it would be too easy to accidentally dead lock your programs
 /// if you were using this without splitting it.
 pub struct LocalSocketStream<T: Serialize + DeserializeOwned + Unpin> {
-    read: OwnedReadHalfTyped<InternalMessage<T>>,
-    write: OwnedWriteHalfTyped<InternalMessage<T>>,
-    next_id: u64,
+    read: AsyncReadConverse<InterprocessOwnedReadHalf, InterprocessOwnedWriteHalf, T>,
+    write: AsyncWriteConverse<InterprocessOwnedWriteHalf, T>,
 }
 
 impl<T: Serialize + DeserializeOwned + Unpin> LocalSocketStream<T> {
@@ -167,64 +109,53 @@ impl<T: Serialize + DeserializeOwned + Unpin> LocalSocketStream<T> {
         name: impl ToLocalSocketName<'a>,
         size_limit: u64,
     ) -> io::Result<Self> {
-        let (read, write) = LocalSocketStreamTyped::connect_with_limit(name, size_limit)
+        let (read, write) = InterprocessLocalSocketStream::connect(name)
             .await?
             .into_split();
+        let (read, write) = new_duplex_connection_with_limit(size_limit, read, write);
         Ok(Self {
             read,
             write,
-            next_id: 0,
         })
     }
 
     /// Creates a connection, initializing it with a default size limit of 1 MB per message.
     pub async fn connect<'a>(name: impl ToLocalSocketName<'a>) -> io::Result<Self> {
-        let (read, write) = LocalSocketStreamTyped::connect(name).await?.into_split();
+        let (read, write) = InterprocessLocalSocketStream::connect(name).await?.into_split();
+        let (read, write) = new_duplex_connection(read, write);
         Ok(Self {
             read,
             write,
-            next_id: 0,
         })
     }
 
     /// Splits this into two parts, the first can be used for reading from the socket, the second can be used for writing to the socket.
     pub fn into_split(self) -> (OwnedReadHalf<T>, OwnedWriteHalf<T>) {
-        let (reply_data_sender, reply_data_receiver) = mpsc::unbounded_channel();
-        let write = Arc::new(Mutex::new(self.write));
-        let write_clone = Arc::clone(&write);
         (
             OwnedReadHalf {
                 raw: self.read,
-                raw_write: write,
-                reply_data_receiver,
-                pending_reply: vec![],
             },
             OwnedWriteHalf {
-                raw: write_clone,
-                next_id: self.next_id,
-                reply_data_sender,
+                raw: self.write,
             },
         )
     }
 
     /// Returns the process id of the connected peer.
     pub fn peer_pid(&self) -> io::Result<u32> {
-        self.read.peer_pid()
+        self.read.inner().peer_pid()
     }
 }
 
 /// Used to receive messages from the connected peer. ***You must drive this in order to receive replies on the [OwnedWriteHalf]***
 pub struct OwnedReadHalf<T: Serialize + DeserializeOwned + Unpin> {
-    raw: OwnedReadHalfTyped<InternalMessage<T>>,
-    raw_write: Arc<Mutex<OwnedWriteHalfTyped<InternalMessage<T>>>>,
-    reply_data_receiver: mpsc::UnboundedReceiver<ReplySender<T>>,
-    pending_reply: Vec<ReplySender<T>>,
+    raw: AsyncReadConverse<InterprocessOwnedReadHalf, InterprocessOwnedWriteHalf, T>,
 }
 
 impl<T: Serialize + DeserializeOwned + Unpin> OwnedReadHalf<T> {
     /// Returns the process id of the connected peer.
     pub fn peer_pid(&self) -> io::Result<u32> {
-        self.raw.peer_pid()
+        self.raw.inner().peer_pid()
     }
 }
 
@@ -242,53 +173,8 @@ impl<T: Serialize + DeserializeOwned + Unpin + Send + 'static> OwnedReadHalf<T> 
 impl<T: Serialize + DeserializeOwned + Unpin> Stream for OwnedReadHalf<T> {
     type Item = Result<ReceivedMessage<T>, Error>;
 
-    fn poll_next(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let Self {
-            ref mut raw,
-            ref mut reply_data_receiver,
-            ref mut pending_reply,
-            ref raw_write,
-        } = self.get_mut();
-        loop {
-            return match Pin::new(&mut *raw).poll_next(cx) {
-                Poll::Ready(Some(Ok(i))) => {
-                    while let Ok(reply_data) = reply_data_receiver.try_recv() {
-                        pending_reply.push(reply_data);
-                    }
-                    let start_len = pending_reply.len();
-                    let mut user_message = Some(i.user_message);
-                    pending_reply.retain_mut(|pending_reply| {
-                        if let Some(reply_sender) = pending_reply.reply_sender.as_ref() {
-                            if reply_sender.is_closed() {
-                                return false;
-                            }
-                        }
-                        let matches =
-                            i.is_reply && pending_reply.conversation_id == i.conversation_id;
-                        if matches {
-                            let _ = pending_reply
-                                .reply_sender
-                                .take()
-                                .expect("infallible")
-                                .send(Ok(user_message.take().expect("infallible")));
-                        }
-                        !matches
-                    });
-                    if start_len == pending_reply.len() {
-                        Poll::Ready(Some(Ok(ReceivedMessage {
-                            message: Some(user_message.take().expect("infallible")),
-                            conversation_id: i.conversation_id,
-                            raw_write: Arc::clone(raw_write),
-                        })))
-                    } else {
-                        continue;
-                    }
-                }
-                Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e.into()))),
-                Poll::Ready(None) => Poll::Ready(None),
-                Poll::Pending => Poll::Pending,
-            };
-        }
+    fn poll_next(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.raw).poll_next(cx).map_err(Into::into)
     }
 }
 
@@ -297,28 +183,23 @@ impl<T: Serialize + DeserializeOwned + Unpin> Stream for OwnedReadHalf<T> {
 /// ***You must drive the corresponding [OwnedReadHalf] in order to receive replies to your messages.***
 /// You can do this either by driving the `Stream` implementation, or calling [OwnedReadHalf::drive_forever].
 pub struct OwnedWriteHalf<T: Serialize + DeserializeOwned + Unpin> {
-    raw: Arc<Mutex<OwnedWriteHalfTyped<InternalMessage<T>>>>,
-    reply_data_sender: mpsc::UnboundedSender<ReplySender<T>>,
-    next_id: u64,
+    raw: AsyncWriteConverse<InterprocessOwnedWriteHalf, T>,
 }
 
 impl<T: Serialize + DeserializeOwned + Unpin> OwnedWriteHalf<T> {
     /// Returns the process id of the connected peer.
     pub async fn peer_pid(&self) -> io::Result<u32> {
-        self.raw.lock().await.peer_pid()
+        self.raw.with_inner(|raw| raw.peer_pid()).await
     }
 
     /// Send a message, and wait for a reply, with the default timeout. Shorthand for `.await`ing both layers of `.send(message)`.
     pub async fn ask(&mut self, message: T) -> Result<T, Error> {
-        self.ask_timeout(DEFAULT_TIMEOUT, message).await
+        self.raw.ask(message).await.map_err(Into::into)
     }
 
     /// Send a message, and wait for a reply, up to timeout. Shorthand for `.await`ing both layers of `.send_timeout(message)`.
     pub async fn ask_timeout(&mut self, timeout: Duration, message: T) -> Result<T, Error> {
-        match self.send_timeout(timeout, message).await {
-            Ok(fut) => fut.await,
-            Err(e) => Err(e),
-        }
+        self.raw.ask_timeout(timeout, message).await.map_err(Into::into)
     }
 
     /// Sends a message to the peer on the other side of the connection. This returns a future wrapped in a future. You must
@@ -328,7 +209,9 @@ impl<T: Serialize + DeserializeOwned + Unpin> OwnedWriteHalf<T> {
         &mut self,
         message: T,
     ) -> Result<impl Future<Output = Result<T, Error>>, Error> {
-        self.send_timeout(DEFAULT_TIMEOUT, message).await
+        self.raw.send(message).await.map_err(Into::into).map(|f| async move {
+            f.await.map_err(Into::into)
+        })
     }
 
     /// Sends a message to the peer on the other side of the connection, waiting up to the specified timeout for a reply.
@@ -340,35 +223,21 @@ impl<T: Serialize + DeserializeOwned + Unpin> OwnedWriteHalf<T> {
         timeout: Duration,
         message: T,
     ) -> Result<impl Future<Output = Result<T, Error>>, Error> {
-        let (reply_sender, reply_receiver) = oneshot::channel();
-        let read_half_dropped = self
-            .reply_data_sender
-            .send(ReplySender {
-                reply_sender: Some(reply_sender),
-                conversation_id: self.next_id,
-            })
-            .is_err();
-        SinkExt::send(
-            &mut *self.raw.lock().await,
-            InternalMessage {
-                user_message: message,
-                conversation_id: self.next_id,
-                is_reply: false,
-            },
-        )
-        .await?;
-        self.next_id = self.next_id.wrapping_add(1);
-        Ok(async move {
-            if read_half_dropped {
-                return Err(Error::ReadHalfDropped);
-            }
-            let res = tokio::time::timeout(timeout, reply_receiver).await;
-            match res {
-                Ok(Ok(Ok(value))) => Ok(value),
-                Ok(Ok(Err(e))) => Err(e),
-                Ok(Err(_)) => Err(Error::ReadHalfDropped),
-                Err(_) => Err(Error::Timeout),
-            }
+        self.raw.send_timeout(timeout, message).await.map_err(Into::into).map(|f| async move {
+            f.await.map_err(Into::into)
         })
+    }
+}
+
+/// Randomly generates a socket name suitable for the operating system in use.
+pub fn generate_socket_name() -> io::Result<OsString> {
+    #[cfg(windows)]
+    {
+        Ok(OsString::from(format!("@{}.sock", uuid::Uuid::new_v4())))
+    }
+    #[cfg(not(windows))]
+    {
+        let path = tempfile::tempdir()?.into_path().join("ipc_socket");
+        Ok(path.into_os_string())
     }
 }
