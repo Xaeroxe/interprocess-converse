@@ -9,7 +9,7 @@ repository = "https://github.com/Xaeroxe/interprocess-converse"
 
 [dependencies]
 futures-util = "0.3"
-async-io-converse = { git = "https://github.com/Xaeroxe/async-io-converse.git" }
+async-io-converse = "1.0"
 interprocess = { git = "https://github.com/Xaeroxe/interprocess.git", features = ["tokio_support"], branch = "patch-1" }
 bincode = "1.3"
 tokio = "1.0"
