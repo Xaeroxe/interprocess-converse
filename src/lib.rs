@@ -1,15 +1,23 @@
 #![doc = include_str!("../README.md")]
 
-use async_io_converse::{AsyncReadConverse, AsyncWriteConverse, new_duplex_connection_with_limit, new_duplex_connection};
+use async_io_converse::{
+    new_duplex_connection, new_duplex_connection_with_limit, AsyncReadConverse, AsyncWriteConverse,
+};
 use futures_util::{Stream, StreamExt};
+use interprocess::local_socket::tokio::{
+    LocalSocketListener as InterprocessLocalSocketListener,
+    LocalSocketStream as InterprocessLocalSocketStream, OwnedReadHalf as InterprocessOwnedReadHalf,
+    OwnedWriteHalf as InterprocessOwnedWriteHalf,
+};
 use serde::{de::DeserializeOwned, Serialize};
-use interprocess::local_socket::tokio::{OwnedWriteHalf as InterprocessOwnedWriteHalf, OwnedReadHalf as InterprocessOwnedReadHalf, LocalSocketListener as InterprocessLocalSocketListener, LocalSocketStream as InterprocessLocalSocketStream};
 use std::{
+    ffi::OsString,
     future::Future,
     io,
+    marker::PhantomData,
     pin::Pin,
     task::{Context, Poll},
-    time::Duration, marker::PhantomData, ffi::OsString,
+    time::Duration,
 };
 
 #[cfg(test)]
@@ -71,10 +79,7 @@ impl<T: Serialize + DeserializeOwned + Unpin> LocalSocketListener<T> {
         self.raw.accept().await.map(|raw| {
             let (read, write) = raw.into_split();
             let (read, write) = new_duplex_connection_with_limit(size_limit, read, write);
-            LocalSocketStream {
-                read,
-                write,
-            }
+            LocalSocketStream { read, write }
         })
     }
 
@@ -83,10 +88,7 @@ impl<T: Serialize + DeserializeOwned + Unpin> LocalSocketListener<T> {
         self.raw.accept().await.map(|raw| {
             let (read, write) = raw.into_split();
             let (read, write) = new_duplex_connection(read, write);
-            LocalSocketStream {
-                read,
-                write,
-            }
+            LocalSocketStream { read, write }
         })
     }
 }
@@ -113,31 +115,23 @@ impl<T: Serialize + DeserializeOwned + Unpin> LocalSocketStream<T> {
             .await?
             .into_split();
         let (read, write) = new_duplex_connection_with_limit(size_limit, read, write);
-        Ok(Self {
-            read,
-            write,
-        })
+        Ok(Self { read, write })
     }
 
     /// Creates a connection, initializing it with a default size limit of 1 MB per message.
     pub async fn connect<'a>(name: impl ToLocalSocketName<'a>) -> io::Result<Self> {
-        let (read, write) = InterprocessLocalSocketStream::connect(name).await?.into_split();
+        let (read, write) = InterprocessLocalSocketStream::connect(name)
+            .await?
+            .into_split();
         let (read, write) = new_duplex_connection(read, write);
-        Ok(Self {
-            read,
-            write,
-        })
+        Ok(Self { read, write })
     }
 
     /// Splits this into two parts, the first can be used for reading from the socket, the second can be used for writing to the socket.
     pub fn into_split(self) -> (OwnedReadHalf<T>, OwnedWriteHalf<T>) {
         (
-            OwnedReadHalf {
-                raw: self.read,
-            },
-            OwnedWriteHalf {
-                raw: self.write,
-            },
+            OwnedReadHalf { raw: self.read },
+            OwnedWriteHalf { raw: self.write },
         )
     }
 
@@ -173,7 +167,10 @@ impl<T: Serialize + DeserializeOwned + Unpin + Send + 'static> OwnedReadHalf<T> 
 impl<T: Serialize + DeserializeOwned + Unpin> Stream for OwnedReadHalf<T> {
     type Item = Result<ReceivedMessage<T>, Error>;
 
-    fn poll_next(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
         Pin::new(&mut self.raw).poll_next(cx).map_err(Into::into)
     }
 }
@@ -199,7 +196,10 @@ impl<T: Serialize + DeserializeOwned + Unpin> OwnedWriteHalf<T> {
 
     /// Send a message, and wait for a reply, up to timeout. Shorthand for `.await`ing both layers of `.send_timeout(message)`.
     pub async fn ask_timeout(&mut self, timeout: Duration, message: T) -> Result<T, Error> {
-        self.raw.ask_timeout(timeout, message).await.map_err(Into::into)
+        self.raw
+            .ask_timeout(timeout, message)
+            .await
+            .map_err(Into::into)
     }
 
     /// Sends a message to the peer on the other side of the connection. This returns a future wrapped in a future. You must
@@ -209,9 +209,11 @@ impl<T: Serialize + DeserializeOwned + Unpin> OwnedWriteHalf<T> {
         &mut self,
         message: T,
     ) -> Result<impl Future<Output = Result<T, Error>>, Error> {
-        self.raw.send(message).await.map_err(Into::into).map(|f| async move {
-            f.await.map_err(Into::into)
-        })
+        self.raw
+            .send(message)
+            .await
+            .map_err(Into::into)
+            .map(|f| async move { f.await.map_err(Into::into) })
     }
 
     /// Sends a message to the peer on the other side of the connection, waiting up to the specified timeout for a reply.
@@ -223,9 +225,11 @@ impl<T: Serialize + DeserializeOwned + Unpin> OwnedWriteHalf<T> {
         timeout: Duration,
         message: T,
     ) -> Result<impl Future<Output = Result<T, Error>>, Error> {
-        self.raw.send_timeout(timeout, message).await.map_err(Into::into).map(|f| async move {
-            f.await.map_err(Into::into)
-        })
+        self.raw
+            .send_timeout(timeout, message)
+            .await
+            .map_err(Into::into)
+            .map(|f| async move { f.await.map_err(Into::into) })
     }
 }
 
